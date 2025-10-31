@@ -46,8 +46,6 @@ func main() {
 
 			peers_mtx.Unlock()
 
-			fmt.Fprintf(os.Stderr, "sending gossip %v to peers %v\n", ev, local_peers)
-
 			for _, peer_id := range local_peers {
 				err := n.Send(peer_id, map[string]any{
 					"type":    "broadcast",
