@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -10,11 +12,26 @@ import (
 func main() {
 	n := maelstrom.NewNode()
 
+	msgs := make(map[int]struct{})
+	mtx := sync.Mutex{}
+
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body map[string]any
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
+
+		// Using a "set" in order to avoid duplicates
+		val, ok := body["message"].(float64)
+		if !ok {
+			return fmt.Errorf("ignoring broadcast with non-number message")
+		}
+
+		mtx.Lock()
+
+		msgs[int(val)] = struct{}{}
+
+		mtx.Unlock()
 
 		reply := map[string]any{
 			"type": "broadcast_ok",
@@ -31,8 +48,17 @@ func main() {
 
 		body["type"] = "read_ok"
 
-		msgs := []any{}
-		body["messages"] = msgs
+		var local_msgs = []int{}
+
+		mtx.Lock()
+
+		for v := range msgs {
+			local_msgs = append(local_msgs, v)
+		}
+
+		mtx.Unlock()
+
+		body["messages"] = local_msgs
 
 		return n.Reply(msg, body)
 	})
