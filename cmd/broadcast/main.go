@@ -52,7 +52,7 @@ func (s *broadcastServer) gossipLoop() {
 
 	pending := make(map[int]pendingAcks)
 
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
 	sendGossip := func(peerId string, msg int) {
@@ -112,7 +112,7 @@ func (s *broadcastServer) gossipLoop() {
 		case <-ticker.C:
 			for msg, acks := range pending {
 				for to, last_sent := range acks {
-					if time.Since(last_sent) > time.Second {
+					if time.Since(last_sent) > 200*time.Millisecond {
 						fmt.Fprintf(os.Stderr, "retry gossip for %v to %v\n", msg, to)
 						sendGossip(to, msg)
 					}
