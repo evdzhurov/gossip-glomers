@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -29,14 +30,16 @@ type broadcastServer struct {
 	peers    []string
 	peersMtx sync.Mutex
 
-	gossipQueue chan gossipEvent
+	gossipQueue    chan gossipEvent
+	gossipAckQueue chan gossipEvent
 }
 
 func newBroadcastServer(n *maelstrom.Node) *broadcastServer {
 	s := &broadcastServer{
-		node:        n,
-		msgs:        make(map[int]struct{}),
-		gossipQueue: make(chan gossipEvent, 128),
+		node:           n,
+		msgs:           make(map[int]struct{}),
+		gossipQueue:    make(chan gossipEvent, 128),
+		gossipAckQueue: make(chan gossipEvent, 128),
 	}
 
 	go s.gossipLoop()
@@ -44,41 +47,78 @@ func newBroadcastServer(n *maelstrom.Node) *broadcastServer {
 }
 
 func (s *broadcastServer) gossipLoop() {
-	type pendingGossip struct {
-		msg  int
-		acks int
+
+	type pendingAcks map[string]time.Time // Node -> Last Sent Time
+
+	pending := make(map[int]pendingAcks)
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	sendGossip := func(peerId string, msg int) {
+		if pending[msg] == nil {
+			pending[msg] = make(pendingAcks)
+		}
+
+		pending[msg][peerId] = time.Now()
+
+		err := s.node.Send(peerId, map[string]any{
+			"type":    "gossip",
+			"message": msg,
+		})
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gossip sent to %v failed with err %v\n", peerId, err)
+		}
 	}
-	pending := make(map[int]*pendingGossip)
 
-	for ev := range s.gossipQueue {
-		var local_peers = []string{}
+	for {
+		select {
+		case ev, ok := <-s.gossipQueue:
+			if !ok {
+				return
+			}
 
-		s.peersMtx.Lock() // TODO: This can be a shared mutex
-		for _, peer_id := range s.peers {
-			if peer_id != ev.from {
-				local_peers = append(local_peers, peer_id)
+			var local_peers = []string{}
+
+			s.peersMtx.Lock() // TODO: This can be a shared mutex
+			for _, peer_id := range s.peers {
+				if peer_id != ev.from {
+					local_peers = append(local_peers, peer_id)
+				}
+			}
+			s.peersMtx.Unlock()
+
+			for _, peerId := range local_peers {
+				sendGossip(peerId, ev.msg)
+			}
+
+		case ack, ok := <-s.gossipAckQueue:
+			if !ok {
+				return
+			}
+
+			fmt.Fprintf(os.Stderr, "gossip ack for %v from %v\n", ack.msg, ack.from)
+
+			acks, ok := pending[ack.msg]
+			if ok {
+				delete(acks, ack.from)
+				if len(acks) == 0 {
+					fmt.Fprintf(os.Stderr, "gossip for %v fully acknowledged - removing\n", ack.msg)
+					delete(pending, ack.msg)
+				}
+			}
+
+		case <-ticker.C:
+			for msg, acks := range pending {
+				for to, last_sent := range acks {
+					if time.Since(last_sent) > time.Second {
+						fmt.Fprintf(os.Stderr, "retry gossip for %v to %v\n", msg, to)
+						sendGossip(to, msg)
+					}
+				}
 			}
 		}
-		s.peersMtx.Unlock()
-
-		pending[ev.msg] = &pendingGossip{
-			msg:  ev.msg,
-			acks: len(local_peers),
-		}
-
-		for _, peer_id := range local_peers {
-			err := s.node.Send(peer_id, map[string]any{
-				"type":    "gossip",
-				"message": ev.msg,
-			})
-
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "gossip sent to %v failed with err %v\n", peer_id, err)
-			}
-		}
-
-		// TODO: Delete only when acknowledged
-		delete(pending, ev.msg)
 	}
 }
 
@@ -202,7 +242,8 @@ func (s *broadcastServer) handleGossipOk(msg maelstrom.Message) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Handling gossip_ok for %v from %v\n", body.Message, msg.Src)
+	s.gossipAckQueue <- gossipEvent{from: msg.Src, msg: body.Message}
+
 	return nil
 }
 
